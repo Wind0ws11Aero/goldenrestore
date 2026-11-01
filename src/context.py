@@ -10,6 +10,9 @@ class RestoreOptions:
     skip_setup: bool = True
     skip_protective_backup: bool = False
     include_keychain: bool = False
+    include_apple_account: bool = False
+    include_apple_identity: bool = True
+    include_find_my_state: bool = True
     merge_phases: bool = True
     supervised: bool = False
     organization_name: str = ""

@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 from .utils import OperationStatus, tr, log_info, log_warn, log_error
-from . import backup, perform_restore, reboot_device
+from . import backup
 from .file_to_restore import FileToRestore, _FileMode
 from .lastapply import is_ios27_scaffolding, load_lastapply, sparse_signature
 from .skip_setup27 import skip_all_setup27
@@ -29,13 +29,16 @@ from .context import RestoreOptions, RestoreSession
 from .inject import _is_encrypted_backup
 from .protective import (
     PreparedBackup,
+    backup_contains_keychain,
     clean_backup_for_restore,
     discard_restore_view,
     inject_files_into_backup,
+    is_backup_encrypted,
     make_restore_view,
     new_protective_backup_dir,
     perform_protective_backup,
     prune_protective_backups,
+    set_will_encrypt,
     verify_backup_payloads,
     WORKING_COPY_PREFIX,
 )
@@ -44,14 +47,72 @@ from pymobiledevice3.lockdown import LockdownClient, create_using_usbmux
 from pymobiledevice3.services.installation_proxy import InstallationProxyService
 from pymobiledevice3.services.lockdown_service import LockdownService
 from pymobiledevice3.services.mobilebackup2 import Mobilebackup2Service
-from pymobiledevice3.exceptions import ConnectionTerminatedError, PasswordRequiredError, InvalidServiceError, CloudConfigurationAlreadyPresentError
+from pymobiledevice3.exceptions import ConnectionTerminatedError, PasswordRequiredError, InvalidServiceError, CloudConfigurationAlreadyPresentError, PyMobileDevice3Exception
 
 from .exceptions import NuggetException
 from .device_errors import is_transient_restore_error, is_find_my_error
 from .device_errors import is_connection_error, is_device_lock_required_error, is_device_locked_error
 
 from packaging.version import Version as _V
+from tempfile import TemporaryDirectory
+from pymobiledevice3.services.diagnostics import DiagnosticsService
 
+async def reboot_device(reboot: bool = False, lockdown_client: LockdownClient = None):
+    if reboot and lockdown_client is not None:
+        print("Success! Rebooting your device...")
+        async with DiagnosticsService(lockdown_client) as diagnostics_service:
+            await diagnostics_service.restart()
+        print("Remember to turn Find My back on!")
+
+
+async def perform_restore(backup: backup.Backup, reboot: bool = False,
+                          lockdown_client: LockdownClient = None,
+                          progress_callback=lambda x: None, udid: str = None):
+    own_lockdown = (lockdown_client is None)
+    try:
+        with TemporaryDirectory() as backup_dir:
+            backup.write_to_directory(Path(backup_dir))
+
+            # GOLDENNUGGET_KEEP_SPARSE=1 keeps a copy of exactly what was sent
+            # to the device — invaluable when the restore is rejected.
+            if os.environ.get("GOLDENNUGGET_KEEP_SPARSE") == "1":
+                import shutil
+                keep = Path(os.environ.get("GOLDENNUGGET_LOG_FILE", "/tmp/gn_sparse_debug")).parent / "gn_sparse_debug"
+                shutil.rmtree(keep, ignore_errors=True)
+                shutil.copytree(backup_dir, keep)
+                print(f"[KEEP_SPARSE] sparse backup copy kept at: {keep}")
+
+            if own_lockdown:
+                # Without a serial usbmux hands back the first device, which
+                # is not necessarily the one being restored.
+                lockdown_client = await create_using_usbmux(serial=udid)
+            async with Mobilebackup2Service(lockdown_client) as mb:
+                # PosterBoard (the only tweak using AppDomain-*) must be
+                # registered in Manifest.plist's Applications dict to avoid
+                # MBErrorDomain/205. skip_apps only governs the post-restore
+                # app re-installation step — AppDomain data is restored
+                # either way (verified on iOS 27 beta 6).
+                await mb.restore(backup_dir, system=True, reboot=False, copy=False,
+                                 source=".", progress_callback=progress_callback,
+                                 skip_apps=False)
+            # reboot the device
+            await reboot_device(reboot, lockdown_client)
+    except PyMobileDevice3Exception as e:
+        if "Find My" in str(e):
+            print("Find My must be disabled in order to use this tool.")
+            print("Disable Find My from Settings (Settings -> [Your Name] -> Find My) and then try again.")
+            raise e
+        elif "crash_on_purpose" not in str(e):
+            raise e
+        else:
+            await reboot_device(reboot, lockdown_client)
+    finally:
+        # If we created this lockdown_client ourselves, close it safely.
+        if own_lockdown and lockdown_client is not None:
+            try:
+                await lockdown_client.close()
+            except Exception:
+                pass
 
 def concat_regular_file(file: FileToRestore, files_list: list[FileToRestore], last_domain: str, last_path: str):
     path, name = os.path.split(file.restore_path)
@@ -125,6 +186,11 @@ def merge_duplicates(original_files: list[FileToRestore]) -> list[FileToRestore]
 # How long to wait for the device to come back after the iOS 27 security
 # recovery before giving up.
 _RECONNECT_TIMEOUT = 20 * 60
+
+# Password used when the flow itself switches backup encryption on just to
+# carry the keychain (it is switched off again once the restore is done, so
+# the device ends in the state the user left it in).
+_KEYCHAIN_DEFAULT_PASSWORD = "gnug"
 
 
 async def _wait_for_device(udid: str, progress_callback,
@@ -469,11 +535,15 @@ async def _restore_ios27(back: backup.Backup, reboot: bool,
                          skip_setup: bool = True,
                          skip_protective_backup: bool = False,
                          include_keychain: bool = False,
+                         auto_enabled_keychain_encryption: bool = False,
                          prompt_choice=None,
                          afc_media: bool = False,
                          merge_phases: bool = True,
                          supervised: bool = False,
-                         organization_name: str = "", stage_callback=None):
+                         organization_name: str = "", stage_callback=None,
+                         include_apple_account: bool = False,
+                         include_apple_identity: bool = True,
+                         include_find_my_state: bool = True):
     """iOS 27+ restore: backup → tweak → wipe → restore → skip setup → reboot.
 
     Six phases: Phase 1 selective protective backup (0-40%), Phase 2 sparse
@@ -487,7 +557,10 @@ async def _restore_ios27(back: backup.Backup, reboot: bool,
         skip_protective_backup=skip_protective_backup,
         include_keychain=include_keychain, merge_phases=merge_phases,
         supervised=supervised, organization_name=organization_name,
-        prompt_choice=prompt_choice, stage_callback=stage_callback)
+        prompt_choice=prompt_choice, stage_callback=stage_callback,
+        include_apple_account=include_apple_account,
+        include_apple_identity=include_apple_identity,
+        include_find_my_state=include_find_my_state)
     udid = lockdown_client.udid
     started = time.monotonic()
     phase_started = started
@@ -524,6 +597,25 @@ async def _restore_ios27(back: backup.Backup, reboot: bool,
             log_info(f"AFC media for this run will be pulled into: {media_dir}")
     backup_complete = False
     sparse_failure = None
+    lc = None
+
+    async def _restore_original_encryption_state() -> None:
+        """Undo the keychain-only encryption switch once it has served its
+        purpose, so the device ends in the state the user left it in."""
+        if not auto_enabled_keychain_encryption:
+            return
+        try:
+            async with _start_mobilebackup2(lc if lc is not None else lockdown_client) as mb:
+                # mobilebackup2 disables encryption the same way it enables it
+                # (ChangePassword): the current password goes in as OldPassword.
+                # We only get here when this flow enabled encryption itself, so
+                # backup_password is the password we set.
+                await set_will_encrypt(mb, False, backup_root, backup_password)
+        except Exception as e:
+            log_warn(f"Backup encryption could not be disabled again after the "
+                     f"keychain restore: {e} — turn it off in Finder (Encrypt "
+                     f"local backup) to return the device to its original state")
+
     try:
         log_info(f"Starting iOS 27 restore for device {udid}")
         log_info(f"Protective backup directory: {protective_dir or backup_root}")
@@ -566,6 +658,10 @@ async def _restore_ios27(back: backup.Backup, reboot: bool,
                 include_photos=True,
                 include_keychain=include_keychain,
                 include_afc_media=bool(media_dir),
+                backup_password=backup_password,
+                include_apple_account=include_apple_account,
+                include_apple_identity=include_apple_identity,
+                include_find_my_state=include_find_my_state,
             )
             prune_protective_backups(udid)
         backup_complete = not skip_protective_backup
@@ -576,7 +672,10 @@ async def _restore_ios27(back: backup.Backup, reboot: bool,
                 clean_backup_for_restore, backup_root, udid,
                 include_keychain=include_keychain,
                 manifest_password=manifest_password,
-                exclude_afc_media_trees=media_store_verified(media_dir)
+                exclude_afc_media_trees=media_store_verified(media_dir),
+                include_apple_account=include_apple_account,
+                include_apple_identity=include_apple_identity,
+                include_find_my_state=include_find_my_state,
             )
         log_info(f"Phase 1: Pruned backup: -{removed_rows} manifest rows, -{removed_files} payload files "
                  f"({time.monotonic() - started:.1f}s into the run)")
@@ -712,6 +811,10 @@ async def _restore_ios27(back: backup.Backup, reboot: bool,
                 mark_phase("3 protective restore")
                 session.client = lc
 
+                # The keychain is safely back on the device — if the flow
+                # switched encryption on just to carry it, switch it off again.
+                await _restore_original_encryption_state()
+
                 # === Phase 4: reboot before the media restore + setup skip (90-95%) ===
                 if stage_callback:
                     stage_callback("restore", "restart" if reboot and skip_setup else "waiting")
@@ -807,6 +910,9 @@ async def _restore_ios27(back: backup.Backup, reboot: bool,
                 "The protective data restore completed, but the device rejected "
                 "the tweak transfer without progress. Tweaks were not applied.") from sparse_failure
     except BaseException as e:
+        # Best effort: leave the device in the state the user found it in,
+        # even when the run failed mid-way.
+        await _restore_original_encryption_state()
         if backup_complete:
             kept = backup_root if not using_cache else prepared_backup_root.root
             log_error(f"Restore failed; protective backup kept at: {kept}")
@@ -846,8 +952,68 @@ def _is_ios27_scaffolding(file) -> bool:
     return is_ios27_scaffolding(file.domain, path.lstrip("/"))
 
 
-# files is a list of FileToRestore objects
-async def restore_files(files: list[FileToRestore], reboot: bool = False, lockdown_client: LockdownClient = None, progress_callback=lambda x: None, backup_password: str = "", prepared_backup_root: PreparedBackup = None, skip_setup: bool = True, skip_protective_backup: bool = False, include_keychain: bool = False, prompt_choice=None, afc_media: bool = False, merge_phases: bool = True, supervised: bool = False, organization_name: str = "", stage_callback=None):
+# files is a list of FileToRestore objects, or a prebuilt backup.Backup
+async def restore_files(files: list[FileToRestore] | backup.Backup = None, reboot: bool = False, lockdown_client: LockdownClient = None, progress_callback=lambda x: None, backup_password: str = "", prepared_backup_root: PreparedBackup = None, skip_setup: bool = True, skip_protective_backup: bool = False, include_keychain: bool = False, prompt_choice=None, afc_media: bool = False, merge_phases: bool = True, supervised: bool = False, organization_name: str = "", stage_callback=None, include_apple_account: bool = False, include_apple_identity: bool = True, include_find_my_state: bool = True):
+    # A prebuilt legacy Backup is restored as-is through the sparse pass;
+    # a list of FileToRestore is turned into one below.
+    sparse_backup = files if isinstance(files, backup.Backup) else None
+    files = [] if sparse_backup is not None else (files or [])
+    if lockdown_client is None:
+        # The flow needs a device session either way — the keychain branch
+        # used to be the only place that opened one, so a call without an
+        # explicit client died later on a None product_version.
+        lockdown_client = await create_using_usbmux()
+    # The keychain only rides an ENCRYPTED backup. When the device does not
+    # encrypt its backups, the flow switches encryption on for the run (with
+    # the user's password, or the default one) and switches it off again
+    # afterwards, so the device ends in the state the user left it in.
+    keychain_encryption_auto = False
+    if include_keychain:
+        keychain_encryption_auto = not await is_backup_encrypted(lockdown_client)
+        if not keychain_encryption_auto and not backup_password:
+            raise NuggetException(
+                "Backup encryption is already enabled on the device, but no "
+                "backup_password was given — the encrypted keychain backup "
+                "cannot be pruned or restored without it")
+        if keychain_encryption_auto and not backup_password:
+            backup_password = _KEYCHAIN_DEFAULT_PASSWORD
+            log_info(f"Backup encryption is off — the flow will enable it with "
+                     f"the default password '{_KEYCHAIN_DEFAULT_PASSWORD}' to "
+                     f"carry the keychain, and disable it again after the restore")
+        # The device only imports KeychainDomain when it restores onto a FRESH
+        # (post-wipe) system. In merged mode the protective restore overlays a
+        # live device, which keeps its running keychain — the restored Apple ID
+        # account record (Library/Accounts) would then lack its credentials and
+        # the device asks to verify the Apple ID. Force the classic flow so the
+        # sparse pass triggers the security-recovery wipe and the keychain
+        # actually lands.
+        if merge_phases:
+            merge_phases = False
+            log_info("include_keychain=True — forcing the classic (non-merged) "
+                     "flow: the keychain is only restored to a wiped device, so "
+                     "the sparse pass must trigger the security-recovery wipe "
+                     "before the protective restore")
+        log_warn("include_keychain=True — the keychain blob rides the backup, "
+                 "but Phase 3 is a selective restore (it does not erase the "
+                 "device), so the restore agent may not re-import the keychain. "
+                 "If iOS still asks the user to verify the Apple ID, the "
+                 "account record landed without its credentials — pass "
+                 "include_apple_account=False to drop the account state instead")
+    if not include_apple_account:
+        log_info("include_apple_account=False — the Apple-ID account state "
+                 "(Library/Accounts, Library/IdentityServices, the Apple "
+                 "account preference plists and the Find My / adid containers) "
+                 "is left out of the protective backup and restore. The device "
+                 "ends up signed out of the Apple Account, and the post-restore "
+                 "\"verify your Apple ID\" prompt becomes impossible")
+    if not include_apple_identity:
+        log_info("include_apple_identity=False — the Apple-ID session state "
+                 "(Library/IdentityServices and the identity/IDS account "
+                 "preference plists) is left out of the protective backup and "
+                 "restore, matching upstream GoldenNugget's scope. The "
+                 "account record itself is still restored, so the device stays "
+                 "signed in — it just re-uses its own session instead of the "
+                 "restored token cache")
     files_list = []
     apps_list = []
     active_bundle_ids = []
@@ -866,11 +1032,39 @@ async def restore_files(files: list[FileToRestore], reboot: bool = False, lockdo
         dev_dir = Path(prepared_backup_root.root) / udid
         if not dev_dir.is_dir() and (Path(prepared_backup_root.root) / "Manifest.db").exists():
             dev_dir = Path(prepared_backup_root.root)
-        inject_all = not _is_encrypted_backup(dev_dir)
-        if not inject_all:
-            log_warn("Prepared backup is encrypted — injecting tweaks is "
-                     "impossible (MBErrorDomain/205); falling back to sparse "
-                     "restore delivery")
+        prepared_encrypted = _is_encrypted_backup(dev_dir)
+        if include_keychain:
+            # The keychain only rides an encrypted backup that actually
+            # uploaded it. An unencrypted prepared backup has none, and an
+            # encrypted one can still lack it — a cache master refreshed
+            # without include_keychain never uploaded KeychainDomain. In both
+            # cases swap it for a fresh encrypted backup in Phase 1: restoring
+            # the Apple ID account record (Library/Accounts) without the
+            # keychain is exactly what triggers the on-device "verify your
+            # Apple ID" prompt. Injection now handles encrypted manifests, so
+            # the tweaks are injected into the (fresh or cached) encrypted
+            # backup and survive the security-recovery wipe — the keychain
+            # then lands in Phase 3.
+            if not prepared_encrypted:
+                log_warn("include_keychain=True but the prepared backup is "
+                         "unencrypted — it has no keychain. Taking a fresh "
+                         "encrypted protective backup and injecting the tweaks "
+                         "into it")
+                prepared_backup_root = None
+            elif not backup_contains_keychain(prepared_backup_root.root, udid):
+                log_warn("include_keychain=True but the prepared backup "
+                         "contains no keychain (it was taken without "
+                         "include_keychain) — it cannot restore the Apple ID "
+                         "credentials. Taking a fresh encrypted protective "
+                         "backup and injecting the tweaks into it")
+                prepared_backup_root = None
+            inject_all = True
+        else:
+            inject_all = not prepared_encrypted
+            if not inject_all:
+                log_warn("Prepared backup is encrypted — injecting tweaks is "
+                         "impossible (MBErrorDomain/205); falling back to sparse "
+                         "restore delivery")
     require_protective_delivery(sorted_files, inject_all)
     inject_files = []
     for file in sorted_files:
@@ -941,6 +1135,18 @@ async def restore_files(files: list[FileToRestore], reboot: bool = False, lockdo
                  "restore (Phase 3) delivers the tweak/wallpaper files "
                  "directly")
         files_list = []
+    # The keychain only lands on a wiped device, and the wipe is triggered by
+    # the Phase 2 sparse pass (reboot -> security recovery). When nothing would
+    # ride the sparse pass — the inject flow skips it, or only wallpapers are
+    # being delivered — keep a minimal crash_on_purpose payload so the reboot
+    # (and with it the wipe) still happens before Phase 3.
+    if include_keychain and not files_list:
+        files_list.append(backup.ConcreteFile(
+            "", "SysContainerDomain-../../../../../../../.." + "/crash_on_purpose",
+            contents=b""))
+        log_info("include_keychain=True — keeping a minimal sparse pass "
+                 "(crash_on_purpose) so the security-recovery wipe triggers "
+                 "before the protective restore")
 
     values = getattr(lockdown_client, "all_values", {}) or {}
     device_manifest = {k: values[k] for k in (
@@ -949,21 +1155,14 @@ async def restore_files(files: list[FileToRestore], reboot: bool = False, lockdo
 
     device_ver = _V(lockdown_client.product_version)
     manifest_ios27 = device_ver >= _V("27.0")
-    back = backup.Backup(files=files_list, apps=apps_list,
-                         device_manifest=device_manifest,
-                         manifest_ios27=manifest_ios27)
-
-    if merge_phases and os.environ.get("GOLDENNUGGET_NO_MERGE_PHASES") == "1":
-        merge_phases = False
-        log_warn("GOLDENNUGGET_NO_MERGE_PHASES=1 — restoring the classic "
-                 "reboot-then-wipe flow (sparse restore reboots the device "
-                 "and iOS fully wipes before the protective restore)")
-
-    if os.environ.get("GOLDENNUGGET_NO_PROTECTIVE_BACKUP") == "1":
-        skip_protective_backup = True
-        log_warn("GOLDENNUGGET_NO_PROTECTIVE_BACKUP=1 — forcing iOS 26-style "
-                 "single-pass sparse restore (no protective backups, no "
-                 "security-recovery wipe)")
+    if sparse_backup is not None:
+        log_info(f"Restoring prebuilt Backup ({len(sparse_backup.files)} files, "
+                 f"{len(sparse_backup.apps)} apps) via sparse restore")
+        back = sparse_backup
+    else:
+        back = backup.Backup(files=files_list, apps=apps_list,
+                             device_manifest=device_manifest,
+                             manifest_ios27=manifest_ios27)
 
     if device_ver >= _V("27.0"):
         if skip_protective_backup:
@@ -1000,21 +1199,29 @@ async def restore_files(files: list[FileToRestore], reboot: bool = False, lockdo
                                  inject_files=inject_files,
                                  skip_setup=skip_setup,
                                  skip_protective_backup=skip_protective_backup,
-                                 include_keychain=include_keychain,
-                                 prompt_choice=prompt_choice,
-                                 afc_media=afc_media,
+                                  include_keychain=include_keychain,
+                                  auto_enabled_keychain_encryption=keychain_encryption_auto,
+                                  prompt_choice=prompt_choice,
+                                  afc_media=afc_media,
                                  merge_phases=merge_phases,
                                  supervised=supervised,
                                  organization_name=organization_name,
-                                 stage_callback=stage_callback)
+                                 stage_callback=stage_callback,
+                                 include_apple_account=include_apple_account,
+                                 include_apple_identity=include_apple_identity,
+                                 include_find_my_state=include_find_my_state)
     else:
         if exploit_only and skip_setup:
-            files_list.append(backup.ConcreteFile(
+            crash_file = backup.ConcreteFile(
                 "", "SysContainerDomain-../../../../../../../.." + "/crash_on_purpose",
-                contents=b""))
-            back = backup.Backup(files=files_list, apps=apps_list,
-                                 device_manifest=device_manifest,
-                                 manifest_ios27=False)
+                contents=b"")
+            if sparse_backup is not None:
+                sparse_backup.files.append(crash_file)
+            else:
+                files_list.append(crash_file)
+                back = backup.Backup(files=files_list, apps=apps_list,
+                                     device_manifest=device_manifest,
+                                     manifest_ios27=False)
         try:
             await perform_restore(backup=back, reboot=reboot,
                                   lockdown_client=lockdown_client,

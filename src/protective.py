@@ -23,6 +23,7 @@ included only when backup encryption is enabled.
 """
 
 import asyncio
+import hashlib
 import os
 import shutil
 import sqlite3
@@ -37,6 +38,7 @@ from typing import Optional
 
 import pymobiledevice3.exceptions as _pm3_exc
 import pymobiledevice3.service_connection as _sc
+from pymobiledevice3.services.device_link import DeviceLink
 from pymobiledevice3.lockdown import LockdownClient
 from pymobiledevice3.exceptions import NotEnoughDiskSpaceError
 from pymobiledevice3.services.mobilebackup2 import (
@@ -257,6 +259,75 @@ ADDRESS_BOOK_PATH_PREFIXES = (
     "Library/AddressBook",
 )
 
+# Path prefixes within HomeDomain holding the IdentityServices persistence
+# store (iMessage / iCloud account identity). Carried so the device keeps its
+# identity across the security-recovery wipe.
+IDENTITY_SERVICES_PATH_PREFIXES = (
+    "Library/IdentityServices",
+)
+
+# System containers carrying Find My / device-identity state. Restored so the
+# device keeps its Find My / iCloud identity across the security-recovery wipe
+# (avoids the post-restore "verify your Apple ID" prompt).
+PROTECTIVE_IDENTITY_DOMAINS = frozenset({
+    "SysContainerDomain-com.apple.icloud.findmydeviced",
+    "SysSharedContainerDomain-systemgroup.com.apple.icloud.findmydevice.managed",
+    "SysContainerDomain-com.apple.adid",
+})
+
+# Domains whose uploads may be domain-qualified in the device-side name.
+# Longest first, so "SysSharedContainerDomain-…" wins over a shorter prefix.
+_DOMAIN_PREFIXES = tuple(sorted(
+    {"HomeDomain", "SystemPreferencesDomain", "MessagesDomain",
+     "AddressBookDomain", "CameraRollDomain", "MediaDomain",
+     "KeychainDomain"} | set(PROTECTIVE_IDENTITY_DOMAINS),
+    key=len, reverse=True))
+
+# Apple-ID state, split into three groups.
+#
+# * account record — which Apple Account the device is signed into
+#   (``Library/Accounts`` + the Apple-account preference plists). Restoring
+#   this onto a device that has no matching keychain credential is the
+#   *proven* trigger of the post-restore "verify your Apple ID" prompt: the
+#   device finds an account it cannot authenticate and asks the user. The
+#   iOS 27 selective restore cannot re-import a backup keychain, so this
+#   group must stay out of the protective restore by default.
+# * session state — the identity-services token / provisioning cache and the
+#   account-daemon preference plists. Upstream GoldenNugget does not carry
+#   these either; restoring them is harmless but pointless (the device keeps
+#   its own live copy in the merged flow).
+# * Find My / adid identity — the containers that keep the Find My identity
+#   alive across the safe-state recovery wipe. Upstream does not carry them
+#   either, but they are the reason the wipe does not cost the user their
+#   Find My setup, so they are kept by default.
+#
+# The App Store / media-purchase account state (com.apple.itunesstored,
+# com.apple.amsaccountsd) is in none of these groups: it is a separate
+# account and does not drive the verification prompt.
+APPLE_ID_ACCOUNT_PATH_PREFIXES = (
+    "Library/Accounts",               # Account database (Accounts3.sqlite)
+)
+
+APPLE_ID_ACCOUNT_PREF_PREFIXES = (
+    "Library/Preferences/com.apple.appleaccount",
+)
+
+APPLE_ID_SESSION_PATH_PREFIXES = IDENTITY_SERVICES_PATH_PREFIXES
+
+APPLE_ID_SESSION_PREF_PREFIXES = (
+    "Library/Preferences/com.apple.ids",
+    "Library/Preferences/com.apple.identityservices",
+    "Library/Preferences/com.apple.accountsd",
+    "Library/Preferences/com.apple.madrid",
+)
+
+# The Find My / adid identity containers and the preference plists that go
+# with them.
+FIND_MY_PREF_PREFIXES = (
+    "Library/Preferences/com.apple.icloud.findmydeviced",
+    "Library/Preferences/com.apple.fairplaydeviceidentityd",
+)
+
 # Files/dirs inside the protective HomeDomain scope that tweaks write
 # themselves — restoring the stale copies would undo the applied tweaks.
 _SKIP_PATH_PREFIXES = (
@@ -281,11 +352,111 @@ POSTERBOARD_DB_NAME = "PBFPosterExtensionDataStoreSQLiteDatabase.sqlite3"
 POSTERBOARD_DB_STORE_DIR = "PRBPosterExtensionDataStore"
 
 
+def _is_apple_id_session(domain: str, relative_path: str) -> bool:
+    """Whether a manifest entry carries Apple-ID session/token state."""
+    if domain != "HomeDomain" or not relative_path:
+        return False
+    return (relative_path.startswith(APPLE_ID_SESSION_PATH_PREFIXES)
+            or relative_path.startswith(APPLE_ID_SESSION_PREF_PREFIXES))
+
+
+def _is_apple_id_account(domain: str, relative_path: str) -> bool:
+    """Whether a manifest entry carries the Apple-ID account record."""
+    if domain != "HomeDomain" or not relative_path:
+        return False
+    return (relative_path.startswith(APPLE_ID_ACCOUNT_PATH_PREFIXES)
+            or relative_path.startswith(APPLE_ID_ACCOUNT_PREF_PREFIXES))
+
+
+def _is_find_my_state(domain: str, relative_path: str) -> bool:
+    """Whether a manifest entry carries the Find My / adid identity state."""
+    if domain in PROTECTIVE_IDENTITY_DOMAINS:
+        return True
+    if domain != "HomeDomain" or not relative_path:
+        return False
+    return relative_path.startswith(FIND_MY_PREF_PREFIXES)
+
+
+def _drop_apple_id(domain: str, relative_path: str, include_apple_account: bool,
+                   include_apple_identity: bool,
+                   include_find_my_state: bool) -> bool:
+    """Whether the entry must be kept out of the protective backup."""
+    if not include_apple_account and _is_apple_id_account(domain, relative_path):
+        return True
+    if not include_apple_identity and _is_apple_id_session(domain, relative_path):
+        return True
+    if not include_find_my_state and _is_find_my_state(domain, relative_path):
+        return True
+    return False
+
+
+def _device_relative_path(device_name: str) -> str:
+    """An upload's path inside its domain, for both device-side name layouts.
+
+    Pre-iOS 27 the upload name is domain-qualified
+    (``HomeDomain/Library/Preferences/x.plist``); on iOS 27 the HomeDomain
+    tree carries no domain prefix (``/.b/6/Library/Preferences/x.plist``).
+    Both are reduced to the path the manifest row uses, so the upload filter
+    and the prune filter can be compared directly.
+    """
+    name = _device_tree_name(device_name)
+    for domain in _DOMAIN_PREFIXES:
+        if name.startswith(domain + "/"):
+            return name[len(domain) + 1:]
+    return name
+
+
+def _is_apple_id_session_upload(device_name: str) -> bool:
+    """Whether an upload carries Apple-ID session/token state."""
+    relative_path = _device_relative_path(device_name)
+    return (relative_path.startswith(APPLE_ID_SESSION_PATH_PREFIXES)
+            or relative_path.startswith(APPLE_ID_SESSION_PREF_PREFIXES))
+
+
+def _is_apple_id_account_upload(device_name: str) -> bool:
+    """Whether an upload carries the Apple-ID account record."""
+    relative_path = _device_relative_path(device_name)
+    return (relative_path.startswith(APPLE_ID_ACCOUNT_PATH_PREFIXES)
+            or relative_path.startswith(APPLE_ID_ACCOUNT_PREF_PREFIXES))
+
+
+def _is_find_my_state_upload(device_name: str) -> bool:
+    """Whether an upload carries the Find My / adid identity state."""
+    # The Find My / adid system containers: the upload name carries the
+    # container id, not the domain (iOS 27 physical tree).
+    if _identity_container_domain(device_name) in PROTECTIVE_IDENTITY_DOMAINS:
+        return True
+    for domain in PROTECTIVE_IDENTITY_DOMAINS:
+        if _domain_match(device_name, domain):
+            return True
+    relative_path = _device_relative_path(device_name)
+    return relative_path.startswith(FIND_MY_PREF_PREFIXES)
+
+
+def _drop_apple_id_upload(device_name: str, include_apple_account: bool,
+                          include_apple_identity: bool,
+                          include_find_my_state: bool) -> bool:
+    """Upload-side twin of :func:`_drop_apple_id`."""
+    if not include_apple_account and _is_apple_id_account_upload(device_name):
+        return True
+    if not include_apple_identity and _is_apple_id_session_upload(device_name):
+        return True
+    if not include_find_my_state and _is_find_my_state_upload(device_name):
+        return True
+    return False
+
+
 def _is_protective_file(domain: str, relative_path: str, include_photos: bool = True, include_keychain: bool = False,
-                        exclude_afc_media_trees: bool = False) -> bool:
+                        exclude_afc_media_trees: bool = False,
+                        include_apple_account: bool = False,
+                        include_apple_identity: bool = True,
+                        include_find_my_state: bool = True) -> bool:
     """Check if a file belongs in the protective backup."""
     filename = relative_path.rsplit("/", 1)[-1]
     if filename in _SKIP_FILES and not (include_keychain and filename == "keychain-backup.plist"):
+        return False
+    if _drop_apple_id(domain, relative_path, include_apple_account,
+                      include_apple_identity, include_find_my_state):
         return False
     if domain == "HomeDomain":
         if relative_path.startswith(_SKIP_PATH_PREFIXES):
@@ -299,7 +470,10 @@ def _is_protective_file(domain: str, relative_path: str, include_photos: bool = 
                 or relative_path.startswith(WEB_CLIPS_PATH_PREFIXES)
                 or relative_path.startswith(WEB_APP_PATH_PREFIXES)
                 or relative_path.startswith(WEBKIT_WEBSITE_DATA_PATH_PREFIXES)
-                or relative_path.startswith(ADDRESS_BOOK_PATH_PREFIXES))
+                or relative_path.startswith(ADDRESS_BOOK_PATH_PREFIXES)
+                or relative_path.startswith(IDENTITY_SERVICES_PATH_PREFIXES))
+    if domain in PROTECTIVE_IDENTITY_DOMAINS:
+        return True
     if include_photos and domain in PROTECTIVE_DOMAINS:
         if exclude_afc_media_trees and _media_tree_scope(relative_path) in AFC_MEDIA_TREES:
             return False
@@ -313,9 +487,41 @@ def _norm_device_name(device_name: str) -> str:
     return device_name.replace("\\", "/").lstrip("/")
 
 
+# iOS 27 physical tree: uploads arrive under ``/.b/<n>/<segment>/`` and the
+# segment is the *physical* directory name, not the manifest domain name —
+# verified against a real iOS 27 backup (``preferences`` carries
+# SystemPreferencesDomain 13/13, ``protected`` ProtectedDomain 5/5,
+# ``wireless`` WirelessDomain, ``root`` RootDomain, ``Managed Preferences``
+# ManagedPreferencesDomain, ``db`` DatabaseDomain, ``installd`` InstallDomain,
+# ``networkd`` NetworkDomain, ``MobileDevice`` MobileDeviceDomain,
+# ``Keychains`` KeychainDomain). Pre-iOS 27 devices upload ``<domain>/...``.
+_TREE_DOMAIN_SEGMENTS = {
+    "Keychains": "KeychainDomain",
+    "MobileDevice": "MobileDeviceDomain",
+    "Managed Preferences": "ManagedPreferencesDomain",
+    "preferences": "SystemPreferencesDomain",
+    "protected": "ProtectedDomain",
+    "root": "RootDomain",
+    "wireless": "WirelessDomain",
+    "db": "DatabaseDomain",
+    "installd": "InstallDomain",
+    "networkd": "NetworkDomain",
+}
+
+
 def _domain_match(device_name: str, domain: str) -> bool:
     name = _norm_device_name(device_name)
-    return name == domain or name.startswith(f"{domain}/")
+    if name == domain or name.startswith(f"{domain}/"):
+        return True
+    # iOS 27 physical tree: match the segment that carries this domain
+    # (e.g. SystemPreferencesDomain travels as ``/.b/<n>/preferences/...``).
+    # Without this the domain-qualified keep-set never matches and those
+    # payloads are dropped while their manifest rows stay, failing the
+    # payload verification.
+    for segment, dom in _TREE_DOMAIN_SEGMENTS.items():
+        if dom == domain and _tree_match(device_name, segment):
+            return True
+    return False
 
 
 def _path_match(device_name: str, path: str) -> bool:
@@ -355,6 +561,29 @@ def _tree_match(device_name: str, *trees: str) -> bool:
     return False
 
 
+def _identity_container_domain(device_name: str) -> Optional[str]:
+    """Map an iOS 27 physical container path to its system-container domain.
+
+    iOS 27 uploads system containers under the physical tree, where the path
+    segment is the container id, not the manifest domain name:
+      ``containers/Shared/SystemGroup/<id>/...`` -> ``SysSharedContainerDomain-<id>``
+      ``containers/System/<id>/...``             -> ``SysContainerDomain-<id>``
+    Pre-iOS 27 devices already upload the domain-qualified name, which
+    ``_domain_match`` handles. Returns the derived domain, or ``None`` when the
+    name is not one of these physical container trees.
+    """
+    name = _device_tree_name(device_name)
+    for prefix, domain_prefix in (
+        ("containers/Shared/SystemGroup/", "SysSharedContainerDomain-"),
+        ("containers/System/", "SysContainerDomain-"),
+    ):
+        if name.startswith(prefix):
+            cid = name[len(prefix):].split("/", 1)[0]
+            if cid:
+                return f"{domain_prefix}{cid}"
+    return None
+
+
 def _media_tree_scope(device_name: str) -> str:
     """Top-level ``Media`` child an upload lives under, or ``""`` if none."""
     name = _device_tree_name(device_name)
@@ -375,14 +604,30 @@ def _posterboard_db_match(device_name: str) -> bool:
 def is_protective_device_file(device_name: str, include_photos: bool = True,
                               include_posterboard: bool = False,
                               include_keychain: bool = False,
-                              exclude_afc_media_trees: bool = False) -> bool:
+                              exclude_afc_media_trees: bool = False,
+                              include_apple_account: bool = False,
+                              include_apple_identity: bool = True,
+                              include_find_my_state: bool = True) -> bool:
     """Mid-stream backup filter: match an upload's device-side name against the keep-set."""
+    if _drop_apple_id_upload(device_name, include_apple_account,
+                             include_apple_identity, include_find_my_state):
+        # Must match the prune filter exactly: an upload kept here but
+        # dropped there leaves a manifest row without a payload, which the
+        # restore agent rejects with MBErrorDomain/205.
+        return False
     for domain in (("CameraRollDomain", "MediaDomain") if include_photos else ()) + \
-            ("SystemPreferencesDomain", "MessagesDomain", "AddressBookDomain"):
+            ("SystemPreferencesDomain", "MessagesDomain", "AddressBookDomain") + \
+            tuple(PROTECTIVE_IDENTITY_DOMAINS):
         if _domain_match(device_name, domain):
             if exclude_afc_media_trees and _media_tree_scope(device_name) in AFC_MEDIA_TREES:
                 continue
             return True
+    # iOS 27 physical container trees (containers/Shared/SystemGroup/<id>,
+    # containers/System/<id>): the domain loop above cannot see them because the
+    # upload name carries the container id, not the domain. Map them back so the
+    # Find My / identity payloads are kept (matching the prune filter).
+    if _identity_container_domain(device_name) in PROTECTIVE_IDENTITY_DOMAINS:
+        return True
     if include_photos and not (exclude_afc_media_trees
                                and _media_tree_scope(device_name) in AFC_MEDIA_TREES) \
             and _tree_match(device_name, "Media"):
@@ -396,12 +641,66 @@ def is_protective_device_file(device_name: str, include_photos: bool = True,
                + CONTROL_CENTER_PATH_PREFIXES + SHORTCUTS_PATH_PREFIXES
                + WEB_CLIPS_PATH_PREFIXES + WEB_APP_PATH_PREFIXES
                + WEBKIT_WEBSITE_DATA_PATH_PREFIXES
-               + ADDRESS_BOOK_PATH_PREFIXES):
+               + ADDRESS_BOOK_PATH_PREFIXES
+               + IDENTITY_SERVICES_PATH_PREFIXES):
         if _path_match(device_name, prefix):
             return True
     if include_posterboard and _posterboard_db_match(device_name):
         return True
     return False
+
+
+async def set_will_encrypt(mb: ProtectiveBackupService, enable: bool, backup_directory: str,
+                           password: str = "") -> None:
+    """Set the device's backup-encryption state via mobilebackup2 ChangePassword.
+
+    ``mb`` is any Mobilebackup2Service (connects lazily). mobilebackup2 has no
+    ``SetBackupOptions`` — that is the old mobilebackup1 command, and the device
+    tears down the session when it receives one. The mobilebackup2 way (as in
+    Finder and tools/idevicebackup2.c) is ``ChangePassword``: enabling sets a
+    ``NewPassword``; disabling supplies the current password as ``OldPassword``
+    — there is no passwordless toggle. Encryption is what makes the device
+    upload KeychainDomain (Apple ID credentials, …) at all.
+
+    The device replies only after acting on the request, which since iOS 13
+    may include an on-device passcode confirmation (LocalAuthentication); keep
+    the session open until the reply arrives instead of timing out host-side.
+
+    Before the final reply the device may ask the host to remove metadata of a
+    previous, now-incompatible backup (an unencrypted ``Snapshot/Manifest.plist``
+    when switching on, the reverse when switching off). ``dl_loop`` answers
+    those requests and returns only on the final ``DLMessageProcessMessage``.
+    """
+    if not password:
+        raise NuggetException(
+            "Changing backup encryption requires the backup password — the "
+            "new one when enabling, the current one when disabling. There is "
+            "no passwordless toggle on the mobilebackup2 protocol.")
+    message: dict = {"MessageName": "ChangePassword",
+                     "TargetIdentifier": mb.lockdown.udid}
+    message["NewPassword" if enable else "OldPassword"] = password
+    try:
+        async with mb.device_link(Path(backup_directory)) as dl:
+            await dl.send_process_message(message)
+            # Handles the device's RemoveItems/GetFreeDiskSpace requests and
+            # returns on the final ProcessMessage (ErrorCode 0), raising
+            # PyMobileDevice3Exception on a non-zero ErrorCode.
+            await dl.dl_loop()
+    except _pm3_exc.ConnectionTerminatedError as e:
+        raise NuggetException(
+            "The device closed the mobilebackup2 session while backup "
+            "encryption was being switched "
+            f"{'on' if enable else 'off'} — unlock the device, answer (or "
+            "cancel) any on-device passcode prompt, and retry") from e
+    except _pm3_exc.PyMobileDevice3Exception as e:
+        raise NuggetException(
+            f"Device refused to {'enable' if enable else 'disable'} "
+            f"backup encryption: {e}") from e
+    if enable:
+        log_info(f"Backup encryption enabled (password "
+                 f"{'set by the tool' if password else 'chosen on the device'})")
+    else:
+        log_info("Backup encryption disabled — device back in its original state")
 
 
 class ProtectiveBackupService(Mobilebackup2Service):
@@ -471,6 +770,11 @@ class ProtectiveBackupService(Mobilebackup2Service):
         finally:
             await stack.aclose()
 
+    async def enable_backup_encryption(self, backup_directory: str,
+                                       password: str = "") -> None:
+        """Turn on backup encryption (see ``set_will_encrypt``)."""
+        await set_will_encrypt(self, True, backup_directory, password)
+
     async def init_mobile_backup_factory_info(self, afc):
         root_node = self.lockdown.all_values
         info = {
@@ -537,6 +841,10 @@ async def perform_protective_backup(
     include_afc_media: bool = False,
     media_root: str = None,
     afc_media_diff: bool = False,
+    backup_password: str = "",
+    include_apple_account: bool = False,
+    include_apple_identity: bool = True,
+    include_find_my_state: bool = True,
 ) -> bool:
     report_progress = progress_callback
     authentication_presented = False
@@ -610,7 +918,10 @@ async def perform_protective_backup(
             include_photos=include_photos,
             include_posterboard=include_posterboard,
             include_keychain=include_keychain,
-            exclude_afc_media_trees=include_afc_media)
+            exclude_afc_media_trees=include_afc_media,
+            include_apple_account=include_apple_account,
+            include_apple_identity=include_apple_identity,
+            include_find_my_state=include_find_my_state)
         _totals["seen"] += 1
         _totals["kept"] += int(keep)
         low = name.lower()
@@ -632,6 +943,16 @@ async def perform_protective_backup(
                 pass
             if include_keychain is None:
                 include_keychain = is_encrypted
+            if include_keychain and not is_encrypted:
+                # The keychain (Apple ID credentials, …) is only ever uploaded
+                # by an ENCRYPTED backup, so enable encryption on the fly —
+                # without it the post-restore "verify your Apple ID" prompt
+                # has to be answered by hand (no saved credential).
+                log_info("Backup encryption is off — enabling it so the keychain "
+                         "is backed up and restored with the account")
+                progress_callback("Enabling backup encryption for the keychain...")
+                await mb.enable_backup_encryption(backup_root, backup_password)
+                is_encrypted = True
             if is_encrypted:
                 log_info("Backup encryption already enabled on device.")
                 progress_callback("Using existing backup encryption...")
@@ -683,6 +1004,35 @@ async def is_backup_encrypted(lockdown_client: LockdownClient) -> bool:
     except Exception as e:
         log_warn(f"Could not read backup encryption state: {e}")
         return False
+
+
+# The keychain's on-disk identity. The device uploads it as
+# ``KeychainDomain/keychain-backup.plist``; the payload lives under the
+# standard ``<aa>/<fileID>`` layout with ``fileID = SHA1("<domain>-<relativePath>")``.
+KEYCHAIN_BACKUP_FILENAME = "keychain-backup.plist"
+
+
+def backup_contains_keychain(backup_dir, udid: str) -> Optional[bool]:
+    """Whether a backup's payload tree carries the keychain blob.
+
+    Returns ``None`` when the backup's device directory cannot be identified.
+    The check is a plain payload-existence probe (no manifest read), so it
+    works for encrypted and unencrypted backups alike and needs no password.
+    A backup taken without ``include_keychain`` — e.g. a cache master
+    refreshed with the default — has no ``KeychainDomain`` upload and
+    therefore no such payload, even when encrypted.
+    """
+    device_dir = Path(backup_dir) / udid
+    if not device_dir.is_dir():
+        if (Path(backup_dir) / "Manifest.db").exists():
+            device_dir = Path(backup_dir)
+        else:
+            return None
+    # fileID convention: SHA1("<domain>-<relativePath>") — see inject.py.
+    file_id = hashlib.sha1(
+        f"{KEYCHAIN_DOMAIN}-{KEYCHAIN_BACKUP_FILENAME}".encode("utf-8")
+    ).hexdigest()
+    return (device_dir / file_id[:2] / file_id).is_file()
 
 
 # Retention for finished live backups: how many to keep per device.
@@ -967,10 +1317,20 @@ def extract_posterboard_db(backup_root: str, udid: str, dest_path: str) -> Optio
 
 def _keep_protective_entry(domain: str, relative_path: str, include_photos: bool = True,
                            include_keychain: bool = False,
-                           exclude_afc_media_trees: bool = False) -> bool:
+                           exclude_afc_media_trees: bool = False,
+                           include_apple_account: bool = False,
+                           include_apple_identity: bool = True,
+                           include_find_my_state: bool = True) -> bool:
     """Keep-set predicate shared by the plain and encrypted prune paths."""
+    if _drop_apple_id(domain, relative_path, include_apple_account,
+                      include_apple_identity, include_find_my_state):
+        # The Apple-ID groups are dropped as a whole — including the domain
+        # root rows (relative_path == "") of the Find My / adid containers,
+        # which never reach _is_protective_file.
+        return False
     if domain and relative_path and (_is_protective_file(domain, relative_path, include_photos, include_keychain,
-                                                         exclude_afc_media_trees)
+                                                         exclude_afc_media_trees, include_apple_account,
+                                                         include_apple_identity, include_find_my_state)
                                      or domain == "SystemPreferencesDomain"):
         return True
     if relative_path == "" and domain in ("SystemPreferencesDomain", "MessagesDomain"):
@@ -985,7 +1345,10 @@ def clean_backup_for_restore(backup_dir, udid: str,
                              include_keychain: bool = False,
                              manifest_password: str = "",
                              exclude_afc_media_trees: bool = False,
-                             collect_inode: bool = False) -> PruneResult:
+                             collect_inode: bool = False,
+                             include_apple_account: bool = False,
+                             include_apple_identity: bool = True,
+                             include_find_my_state: bool = True) -> PruneResult:
     """Prune a backup directory down to its protective payload.
 
     1. Deletes every non-protective row from Manifest.db in a single DELETE.
@@ -1010,15 +1373,28 @@ def clean_backup_for_restore(backup_dir, udid: str,
         if not manifest_password:
             log_info("Backup is encrypted and no password was given — skipping local manifest pruning")
             return PruneResult()
+        dropped_apple_id = [0]
+
         def _keep(bf) -> bool:
             if bf.domain is None or bf.relative_path is None:
                 return False
+            if _drop_apple_id(bf.domain, bf.relative_path, include_apple_account,
+                              include_apple_identity, include_find_my_state):
+                dropped_apple_id[0] += 1
+                return False
             return _keep_protective_entry(bf.domain, bf.relative_path, include_photos, include_keychain,
-                                          exclude_afc_media_trees)
+                                          exclude_afc_media_trees, include_apple_account,
+                                          include_apple_identity, include_find_my_state)
         allowed_ids = Mobilebackup2Service.prune_backup_manifest(
             device_dir, _keep, password=manifest_password)
         removed_files = _remove_orphan_payloads(_payload_inventory(device_dir), allowed_ids)
         log_info(f"Encrypted manifest pruned with password (-{removed_files} orphan payloads)")
+        log_info(f"Encrypted manifest pruned with password (-{removed_files} orphan payloads)")
+        if dropped_apple_id[0]:
+            log_info(f"Prune: dropped {dropped_apple_id[0]} Apple-ID row(s) "
+                     f"(include_apple_account={include_apple_account}, "
+                     f"include_apple_identity={include_apple_identity}, "
+                     f"include_find_my_state={include_find_my_state})")
         return PruneResult(removed_files=removed_files)
 
     if not _validate_sqlite_db(manifest_db):
@@ -1035,13 +1411,25 @@ def clean_backup_for_restore(backup_dir, udid: str,
     try:
         cur = conn.cursor()
         cur.execute("SELECT fileID, domain, relativePath, flags FROM Files")
+        dropped_apple_id = 0
         for file_id, domain, rel_path, flags in cur:
+            if _drop_apple_id(domain, rel_path, include_apple_account,
+                              include_apple_identity, include_find_my_state):
+                dropped_apple_id += 1
+                continue
             if _keep_protective_entry(domain, rel_path, include_photos, include_keychain,
-                                      exclude_afc_media_trees):
+                                      exclude_afc_media_trees, include_apple_account,
+                                      include_apple_identity, include_find_my_state):
                 if flags == 1 and file_id not in present:
                     missing_payloads.append(rel_path)
                 else:
                     keep_ids.add(file_id)
+
+        if dropped_apple_id:
+            log_info(f"Prune: dropped {dropped_apple_id} Apple-ID row(s) "
+                     f"(include_apple_account={include_apple_account}, "
+                     f"include_apple_identity={include_apple_identity}, "
+                     f"include_find_my_state={include_find_my_state})")
 
         if missing_payloads:
             log_warn(f"Prune: dropping {len(missing_payloads)} file rows with missing payloads "

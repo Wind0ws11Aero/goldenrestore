@@ -16,11 +16,17 @@ import logging
 import os
 import plistlib
 import sqlite3
+import struct
 import time
 from pathlib import Path
 from typing import Optional
 
-from .utils import install_payload
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.keywrap import aes_key_wrap
+from pyiosbackup.keybag import Keybag
+from pyiosbackup.manifest_plist import ManifestPlist
+
+from .utils import install_payload, open_payload
 from .mbfile import MBFileArchive, InvalidMBFile
 from .exceptions import NuggetException
 
@@ -332,6 +338,65 @@ def _max_inode_in_manifest(conn) -> int:
     return max_inode
 
 
+def _encrypt_payload(contents: bytes, keybag: Keybag, pc: int) -> tuple[bytes, bytes]:
+    """AES-128-CBC encrypt a payload for an encrypted backup.
+
+    Returns ``(encrypted_payload, wrapped_key)``. The per-file key is random
+    and wrapped by the keybag's class key; the payload is PKCS7-padded and
+    encrypted with a zero IV — matching how BackupAgent2 writes encrypted
+    payloads. The restore agent unwraps the key from the ``EncryptionKey``
+    field and decrypts with the same parameters.
+    """
+    key = os.urandom(16)
+    wrapped = aes_key_wrap(keybag.get_key(pc), key)
+    pad = 16 - len(contents) % 16
+    padded = contents + bytes([pad]) * pad
+    encryptor = Cipher(algorithms.AES(key), modes.CBC(b"\x00" * 16)).encryptor()
+    return encryptor.update(padded) + encryptor.finalize(), wrapped
+
+
+def _set_encryption_key(archive: MBFileArchive, pc: int, wrapped_key: bytes) -> bytes:
+    """Stamp the per-file ``EncryptionKey`` field onto an MBFile archive.
+
+    The field is ``{NS.data: <u32le protection class><wrapped key>,
+    $class: NSData}``, mirroring the blobs BackupAgent2 writes for encrypted
+    backups. Returns the re-encoded blob.
+    """
+    objects = archive.archive["$objects"]
+    nsdata_index = None
+    for i, obj in enumerate(objects):
+        if isinstance(obj, dict) and obj.get("$classname") == "NSData":
+            nsdata_index = i
+            break
+    if nsdata_index is None:
+        nsdata_index = len(objects)
+        objects.append({"$classname": "NSData", "$classes": ["NSData", "NSObject"]})
+    key_dict = {"NS.data": struct.pack("<I", pc) + wrapped_key,
+                "$class": plistlib.UID(nsdata_index)}
+    key_index = len(objects)
+    objects.append(key_dict)
+    archive.fields["EncryptionKey"] = plistlib.UID(key_index)
+    return archive.encode()
+
+
+def _prepare_encrypted_payload(source, destination, keybag: Keybag,
+                               pc: int) -> tuple[int, bytes, bytes]:
+    """Encrypt a payload to disk, returning ``(size, SHA1, wrapped_key)``.
+
+    ``size`` and the SHA1 are of the *unpadded* content (what the restore
+    agent sees after decrypting), matching the unencrypted path's digest.
+    """
+    with open_payload(source) as stream:
+        contents = stream.read()
+    size = len(contents)
+    digest = hashlib.sha1(contents).digest()
+    encrypted, wrapped_key = _encrypt_payload(contents, keybag, pc)
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(encrypted)
+    return size, digest, wrapped_key
+
+
 def inject_files_into_backup(backup_dir, udid: str, files: list,
                              manifest_password: str = "", *, max_inode_hint=None):
     """Add many files to a pruned backup in a single Manifest.db transaction.
@@ -367,11 +432,13 @@ def inject_files_into_backup(backup_dir, udid: str, files: list,
     convention and the payload is placed in the ``<aa>/<fileID>`` layout the
     restore agent expects. Returns ``(injected, unchanged, failed)``.
 
-    Encrypted backups are NOT supported here: their payloads are written to
-    disk encrypted (each with a per-file key wrapped by the manifest keybag),
-    and a locally-injected plaintext payload has no matching wrapped key — the
-    Phase 3 restore agent fails to decrypt it (MBErrorDomain/205). Injection
-    is skipped for encrypted backups rather than corrupting the restore.
+    Encrypted backups ARE supported: each injected payload is AES-128-CBC
+    encrypted with a fresh per-file key, the key is wrapped by the manifest
+    keybag's class key and stamped into the blob's ``EncryptionKey`` field, and
+    the Manifest.db itself is decrypted, patched, and re-encrypted around the
+    transaction. ``manifest_password`` is required for encrypted backups (it
+    unlocks the keybag); without it injection is skipped rather than corrupting
+    the restore.
     """
     device_dir = Path(backup_dir) / udid
     if not device_dir.is_dir():
@@ -385,17 +452,32 @@ def inject_files_into_backup(backup_dir, udid: str, files: list,
     if not manifest_db.exists():
         return 0, 0, len(files)
 
-    if _is_encrypted_backup(device_dir):
-        # See the docstring: plaintext injection into an encrypted backup makes
-        # the Phase 3 restore fail with MBErrorDomain/205.
-        _logger.warning(f"Skipping injection into encrypted backup for {len(files)} files")
+    encrypted = _is_encrypted_backup(device_dir)
+    keybag: Optional[Keybag] = None
+    manifest_key: Optional[bytes] = None
+    work_db = manifest_db
+    decrypted_tmp: Optional[Path] = None
+    if encrypted:
+        if not manifest_password:
+            _logger.error("Encrypted backup but no manifest_password — cannot inject files.")
+            return 0, 0, len(files)
+        # Decrypt the manifest to a temp file so it can be patched as plain
+        # SQLite; it is re-encrypted (and the temp removed) after the commit.
+        decrypted_tmp = manifest_db.with_name(".Manifest.db.gn-decrypted")
+        manifest_key = Mobilebackup2Service._decrypt_backup_manifest_db(
+            device_dir, manifest_password, decrypted_tmp)
+        manifest_plist = device_dir / "Manifest.plist"
+        if not manifest_plist.exists():
+            manifest_plist = device_dir / "Snapshot" / "Manifest.plist"
+        keybag = Keybag.from_manifest(
+            ManifestPlist.from_path(manifest_plist), manifest_password)
+        work_db = decrypted_tmp
+
+    if not _validate_sqlite_db(work_db):
+        _logger.error(f"Manifest.db at {work_db} is not a valid SQLite database. Cannot inject files.")
         return 0, 0, len(files)
 
-    if not _validate_sqlite_db(manifest_db):
-        _logger.error(f"Manifest.db at {manifest_db} is not a valid SQLite database. Cannot inject files.")
-        return 0, 0, len(files)
-
-    conn = sqlite3.connect(str(manifest_db))
+    conn = sqlite3.connect(str(work_db))
     injected = unchanged = 0
     try:
         # Batch-level state, computed once instead of per file:
@@ -435,7 +517,17 @@ def inject_files_into_backup(backup_dir, udid: str, files: list,
             # Ownership is carried verbatim: 0 (root) is a real uid, not a
             # missing value — see _owned().
             payload = device_dir / file_id[:2] / file_id
-            size, digest, changed = install_payload(contents, payload)
+            wrapped_key = None
+            if encrypted:
+                # Protection class matches the blob: the eligibilityd/4 default
+                # or the donor's class, so the keybag class key lines up.
+                pc = 4 if domain == "SysContainerDomain-com.apple.eligibilityd" \
+                    else (int(donor.fields.get("ProtectionClass", 4) or 4) if donor is not None else 4)
+                size, digest, wrapped_key = _prepare_encrypted_payload(
+                    contents, payload, keybag, pc)
+                changed = True
+            else:
+                size, digest, changed = install_payload(contents, payload)
             if donor is None:
                 blob = _build_mbfile_blob(
                     relative_path, contents,
@@ -448,6 +540,8 @@ def inject_files_into_backup(backup_dir, udid: str, files: list,
                     mode=safe_mode, owner=_owned(owner), group=_owned(group),
                     size=size, digest=digest, inode=unique_inode,
                     protection_class=4 if domain == "SysContainerDomain-com.apple.eligibilityd" else None)
+            if encrypted:
+                blob = _set_encryption_key(MBFileArchive.decode(blob), pc, wrapped_key)
             conn.execute(
                 "INSERT OR REPLACE INTO Files (fileID, domain, relativePath, flags, file) "
                 "VALUES (?, ?, ?, ?, ?)",
@@ -458,5 +552,11 @@ def inject_files_into_backup(backup_dir, udid: str, files: list,
         conn.commit()
     finally:
         conn.close()
+
+    if encrypted:
+        # Re-encrypt the patched manifest and drop the temp plaintext copy.
+        Mobilebackup2Service._encrypt_backup_manifest_db(
+            decrypted_tmp, manifest_db, manifest_key)
+        decrypted_tmp.unlink(missing_ok=True)
 
     return injected, unchanged, len(files) - injected - unchanged
